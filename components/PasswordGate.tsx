@@ -2,11 +2,15 @@
 
 import { useState, useEffect } from 'react';
 import { settingsStore } from '@/lib/store/settings-store';
+import { useSubscriptionSync } from '@/lib/hooks/useSubscriptionSync';
 import { Lock } from 'lucide-react';
 
 const SESSION_UNLOCKED_KEY = 'kvideo-unlocked';
 
 export function PasswordGate({ children, hasEnvPassword: initialHasEnvPassword }: { children: React.ReactNode, hasEnvPassword: boolean }) {
+    // Enable background subscription syncing globally
+    useSubscriptionSync();
+
     const [isLocked, setIsLocked] = useState(true);
     const [password, setPassword] = useState('');
     const [error, setError] = useState(false);
@@ -15,57 +19,52 @@ export function PasswordGate({ children, hasEnvPassword: initialHasEnvPassword }
     const [isValidating, setIsValidating] = useState(false);
 
     useEffect(() => {
-        const settings = settingsStore.getSettings();
-        const isUnlocked = sessionStorage.getItem(SESSION_UNLOCKED_KEY) === 'true';
+        let mounted = true;
 
-        // Determine initial lock state immediately
-        // Lock if (local password enabled OR env password exists) AND not already unlocked in session
-        const shouldBeLocked = (settings.passwordAccess || initialHasEnvPassword) && !isUnlocked;
+        const init = async () => {
+            const settings = settingsStore.getSettings();
+            const isUnlocked = sessionStorage.getItem(SESSION_UNLOCKED_KEY) === 'true';
 
-        setIsLocked(shouldBeLocked);
-        setIsClient(true);
+            // 1. Initial local check (fast)
+            const localLocked = (settings.passwordAccess || initialHasEnvPassword) && !isUnlocked;
+            if (mounted) setIsLocked(localLocked);
+            if (mounted) setIsClient(true);
 
-        // Still run background checks to keep everything in sync
-        checkEnvPasswordStatus();
-        checkLockStatus();
-    }, [initialHasEnvPassword]);
+            // 2. Fetch remote config & sync
+            try {
+                const res = await fetch('/api/config');
+                if (!res.ok) throw new Error('Failed to fetch config');
 
-    const checkEnvPasswordStatus = async () => {
-        try {
-            const res = await fetch('/api/config');
-            const data = await res.json();
-            setHasEnvPassword(data.hasEnvPassword);
+                const data = await res.json();
 
-            // Sync subscription sources if provided by environment
-            if (data.subscriptionSources) {
-                settingsStore.syncEnvSubscriptions(data.subscriptionSources);
+                if (mounted) {
+                    setHasEnvPassword(data.hasEnvPassword);
+
+                    // CRITICAL: Sync subscriptions immediately
+                    if (data.subscriptionSources) {
+                        console.log('Syncing env subscriptions:', data.subscriptionSources);
+                        settingsStore.syncEnvSubscriptions(data.subscriptionSources);
+                    }
+
+                    // Re-evaluate lock status with confirmed server state
+                    // We only care about envPassword if we are not unlocked.
+                    // Access control logic:
+                    // Locked IF: (Local setting ON OR Env Password Exists) AND (Not Unlocked)
+                    const confirmLocked = (settings.passwordAccess || data.hasEnvPassword) && !isUnlocked;
+                    setIsLocked(confirmLocked);
+                }
+            } catch (e) {
+                console.error("PasswordGate init failed:", e);
+                // Fallback: rely on initial/local state which was already set
             }
-        } catch {
-            // Silently fail
-        }
-    };
+        };
 
-    const checkLockStatus = async () => {
-        const settings = settingsStore.getSettings();
-        const isUnlocked = sessionStorage.getItem(SESSION_UNLOCKED_KEY) === 'true';
+        init();
 
-        try {
-            const res = await fetch('/api/config');
-            const data = await res.json();
-            // Note: envPasswordSet is not directly used for immediate locking if we want to rely on real-time settings
-            // But we should respect the server config. 
-            // However, for the subscription fix, we mainly care about 'settings.passwordAccess' updating in real-time.
-            const envPasswordSet = data.hasEnvPassword;
-
-            // Updated lock state check
-            const currentlyLocked = (settings.passwordAccess || envPasswordSet) && !isUnlocked;
-            setIsLocked(currentlyLocked);
-        } catch {
-            // Handle error by checking local settings
-            const currentlyLocked = settings.passwordAccess && !isUnlocked;
-            setIsLocked(currentlyLocked);
-        }
-    };
+        return () => {
+            mounted = false;
+        };
+    }, [initialHasEnvPassword]);
 
     // Subscribe to settings changes (real-time updates)
     useEffect(() => {
